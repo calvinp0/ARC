@@ -12,10 +12,30 @@ import unittest
 from unittest.mock import patch
 import numpy as np
 
+from ase import Atoms
+from ase.calculators.emt import EMT
+
 from arc.common import ARC_TESTING_PATH, read_yaml_file, save_yaml_file
 from arc.job.adapters.ase_adapter import ASEAdapter
+from arc.parser.parser import parse_1d_scan_energies
 from arc.species.species import ARCSpecies
-from arc.job.adapters.scripts.ase_script import to_kJmol, numpy_vibrational_analysis, is_linear
+from arc.job.adapters.scripts.ase_script import (is_linear,
+                                                 numpy_vibrational_analysis,
+                                                 relaxed_torsion_scan,
+                                                 rotor_top,
+                                                 run_torsion_scan,
+                                                 to_kJmol)
+
+ETHANE_XYZ = {'symbols': ('C', 'C', 'H', 'H', 'H', 'H', 'H', 'H'),
+              'isotopes': (12, 12, 1, 1, 1, 1, 1, 1),
+              'coords': ((0.0, 0.0, 0.761395),
+                         (0.0, 0.0, -0.761395),
+                         (0.0, 1.017111, 1.157241),
+                         (0.880844, -0.508556, 1.157241),
+                         (-0.880844, -0.508556, 1.157241),
+                         (0.880844, 0.508556, -1.157241),
+                         (-0.880844, 0.508556, -1.157241),
+                         (0.0, -1.017111, -1.157241))}
 
 
 class TestASEAdapter(unittest.TestCase):
@@ -203,6 +223,96 @@ class TestASEAdapter(unittest.TestCase):
         self.assertEqual(len(results['freqs']), 4)
         for i, val in enumerate(freqs[5:]):
             self.assertAlmostEqual(results['freqs'][i], val, delta=1e-3)
+
+    def test_write_input_file_scan(self):
+        """Test that a scan job writes torsions and scan resolution into the input file"""
+        scan_dir = os.path.join(self.project_directory, 'scan_input')
+        os.makedirs(scan_dir, exist_ok=True)
+        job = ASEAdapter(execution_type='incore',
+                         job_type='scan',
+                         project='test_scan',
+                         project_directory=scan_dir,
+                         species=[ARCSpecies(label='ethane', xyz=ETHANE_XYZ)],
+                         torsions=[[2, 0, 1, 5]],
+                         args={'keyword': {'calculator': 'uma', 'model': 'uma-s-1p2'},
+                               'trsh': {'scan_res': 8.0}},
+                         testing=True)
+        job.local_path = scan_dir
+        job.write_input_file()
+        data = read_yaml_file(os.path.join(scan_dir, 'input.yml'))
+        self.assertEqual(data['job_type'], 'scan')
+        self.assertEqual(data['torsions'], [[2, 0, 1, 5]])
+        self.assertEqual(data['scan_res'], 8.0)
+
+    def test_rotor_top(self):
+        """Test resolving the rotating group across a pivot bond"""
+        atoms = Atoms(symbols=ETHANE_XYZ['symbols'], positions=ETHANE_XYZ['coords'])
+        # The dihedral is [2, 0, 1, 5]; pivots are atoms 0 and 1. The group on the atom-1 side is
+        # that carbon and its three hydrogens (5, 6, 7).
+        self.assertEqual(rotor_top(atoms, 0, 1), [1, 5, 6, 7])
+        self.assertEqual(rotor_top(atoms, 1, 0), [0, 2, 3, 4])
+        # A pivot bond inside a ring is ill-defined for a 1D rotor.
+        cyclopropane = Atoms(symbols=('C', 'C', 'C'),
+                             positions=((0.0, 0.87, 0.0), (0.75, -0.43, 0.0), (-0.75, -0.43, 0.0)))
+        with self.assertRaises(ValueError):
+            rotor_top(cyclopropane, 0, 1)
+        # Pivots that are not bonded cannot define a rotating group.
+        with self.assertRaises(ValueError):
+            rotor_top(atoms, 2, 5)
+
+    def test_relaxed_torsion_scan(self):
+        """Test a full 1D relaxed torsional scan on the machinery (EMT keeps it hermetic)"""
+        atoms = Atoms(symbols=ETHANE_XYZ['symbols'], positions=ETHANE_XYZ['coords'])
+        atoms.calc = EMT()
+        result = relaxed_torsion_scan(atoms, [2, 0, 1, 5], step_deg=8.0, nsteps=45,
+                                      fmax=0.05, steps=100)
+        # 8 deg over 360 deg is 46 points including the duplicated endpoint.
+        self.assertEqual(len(result['energies']), 46)
+        self.assertEqual(len(result['angles']), 46)
+        self.assertEqual(result['angles'][0], 0.0)
+        self.assertEqual(result['angles'][-1], 360.0)
+        # The endpoint duplicates the start (a periodic grid).
+        self.assertEqual(result['energies'][0], result['energies'][-1])
+        self.assertTrue(all(np.isfinite(e) for e in result['energies']))
+        self.assertEqual(result['top'], [1, 5, 6, 7])
+        self.assertIn('fmax_worst', result)
+        self.assertIn('branch_gap_max', result)
+        # A non-positive resolution or a zero-length grid is rejected before any division.
+        with self.assertRaises(ValueError):
+            relaxed_torsion_scan(atoms, [2, 0, 1, 5], step_deg=8.0, nsteps=0)
+        with self.assertRaises(ValueError):
+            relaxed_torsion_scan(atoms, [2, 0, 1, 5], step_deg=0.0, nsteps=45)
+
+    def test_run_torsion_scan_output_is_parseable(self):
+        """Test that run_torsion_scan output is readable by ARC's YAML scan parser, in kJ/mol"""
+        atoms = Atoms(symbols=ETHANE_XYZ['symbols'], positions=ETHANE_XYZ['coords'])
+        atoms.calc = EMT()
+        input_dict = {'torsions': [[2, 0, 1, 5]], 'scan_res': 8.0}
+        result = run_torsion_scan(atoms, input_dict, settings={'fmax': 0.05, 'steps': 100})
+        self.assertEqual(len(result['energies']), 46)
+        scan_dir = os.path.join(self.project_directory, 'scan_output')
+        os.makedirs(scan_dir, exist_ok=True)
+        out_path = os.path.join(scan_dir, 'output.yml')
+        save_yaml_file(out_path, {'energies': result['energies'], 'angles': result['angles']})
+        energies, angles = parse_1d_scan_energies(log_file_path=out_path)
+        self.assertIsNotNone(energies)
+        self.assertIsNotNone(angles)
+        self.assertEqual(len(energies), 46)
+        self.assertEqual(len(angles), 46)
+        self.assertAlmostEqual(min(energies), 0.0)  # parser zeroes the minimum, in kJ/mol
+        self.assertGreaterEqual(min(energies), 0.0)
+
+    def test_run_torsion_scan_rejects_multiple_torsions(self):
+        """Test that a 1D scan refuses more than one torsion"""
+        atoms = Atoms(symbols=ETHANE_XYZ['symbols'], positions=ETHANE_XYZ['coords'])
+        atoms.calc = EMT()
+        with self.assertRaises(ValueError):
+            run_torsion_scan(atoms, {'torsions': [[2, 0, 1, 5], [3, 0, 1, 6]], 'scan_res': 8.0}, settings={})
+        with self.assertRaises(ValueError):
+            run_torsion_scan(atoms, {'torsions': None, 'scan_res': 8.0}, settings={})
+        # A non-positive scan resolution is rejected before the 360/scan_res division.
+        with self.assertRaises(ValueError):
+            run_torsion_scan(atoms, {'torsions': [[2, 0, 1, 5]], 'scan_res': 0.0}, settings={})
 
     @classmethod
     def tearDownClass(cls):
