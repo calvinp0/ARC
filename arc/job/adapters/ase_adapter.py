@@ -202,6 +202,11 @@ class ASEAdapter(JobAdapter):
             'irc_direction': self.irc_direction,
             'settings': self.determine_settings(),
         }
+        if self.job_type == 'scan':
+            # A 'scan' job sweeps a whole rotor in one process: pass the torsion(s) and the
+            # scan resolution so ase_script.py can run the relaxed torsional scan itself.
+            input_dict['torsions'] = self.torsions
+            input_dict['scan_res'] = self.scan_res
         save_yaml_file(os.path.join(self.local_path, 'input.yml'), input_dict)
 
     def warn_if_unreliable_uma_sp(self) -> bool:

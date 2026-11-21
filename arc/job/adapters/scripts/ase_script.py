@@ -15,6 +15,7 @@ import numpy as np
 
 from ase import Atoms
 from ase.constraints import FixInternals
+from ase.neighborlist import build_neighbor_list, natural_cutoffs
 from ase.optimize import BFGS, LBFGS, GPMin
 from ase.optimize.sciopt import SciPyFminBFGS, SciPyFminCG
 from ase.vibrations import Vibrations
@@ -129,6 +130,205 @@ def apply_constraints(atoms: Atoms, constraints_data: list):
         elif len(indices) == 4:
             dihedrals.append([constraint[1], indices])
     atoms.set_constraint(FixInternals(bonds=bonds, angles_deg=angles, dihedrals_deg=dihedrals))
+
+
+def rotor_top(atoms: Atoms, pivot_1: int, pivot_2: int) -> list:
+    """
+    Determine the rotating group (the "top") on the ``pivot_2`` side of the ``pivot_1``-``pivot_2`` bond.
+
+    The two pivots are the central atoms of the scanned torsion; breaking their bond splits the
+    molecule into two fragments, and this returns the atom indices reachable from ``pivot_2``.
+
+    This is the same "top" that ``arc.common.determine_top_group_indices`` computes, but kept as a
+    standalone reimplementation on purpose: this script runs in the calculator's own environment
+    (e.g. ``uma_env``), which has neither ARC nor RMG-Py, so it can import neither that function nor
+    the RMG ``Molecule`` it operates on. Connectivity is instead rebuilt from the geometry via ASE's
+    neighbor list. Keep the two traversals in agreement if either changes.
+
+    Args:
+        atoms (Atoms): The molecule.
+        pivot_1 (int): The 0-indexed atom on the fixed side of the rotation axis.
+        pivot_2 (int): The 0-indexed atom on the rotating side of the rotation axis.
+
+    Raises:
+        ValueError: If the pivots are not bonded, or if the pivot bond is part of a ring (a 1D
+                    rotor is then ill-defined).
+
+    Returns:
+        list: The sorted 0-indexed atoms of the rotating group.
+    """
+    nl = build_neighbor_list(atoms, natural_cutoffs(atoms, mult=1.2),
+                             self_interaction=False, bothways=True)
+    adj = {i: set(nl.get_neighbors(i)[0]) for i in range(len(atoms))}
+    if pivot_2 not in adj[pivot_1]:
+        raise ValueError(f'The pivot atoms {pivot_1} and {pivot_2} are not bonded; '
+                         f'cannot determine the rotating group.')
+    adj[pivot_1].discard(pivot_2)
+    adj[pivot_2].discard(pivot_1)
+    seen, stack = {pivot_2}, [pivot_2]
+    while stack:
+        cur = stack.pop()
+        for nb in adj[cur]:
+            if nb not in seen:
+                seen.add(nb)
+                stack.append(nb)
+    if pivot_1 in seen:
+        raise ValueError(f'The pivot bond {pivot_1}-{pivot_2} is part of a ring; '
+                         f'a 1D rotor scan is ill-defined.')
+    return sorted(int(x) for x in seen)
+
+
+def _scan_walk(atoms: Atoms, torsion: list, step_deg: float, nsteps: int, top: list,
+               fmax: float, steps: int, direction: int, optimizer) -> tuple:
+    """
+    Perform one directional sequential relaxed torsional walk.
+
+    Each grid point starts from the previous point's relaxed geometry (a hysteretic walk), so a
+    coupled coordinate can carry the walk into a different conformer and never return - which is
+    why a full scan runs this in both directions and keeps the lower branch at each point.
+
+    Args:
+        atoms (Atoms): The molecule with a calculator attached (not modified; a copy is walked).
+        torsion (list): The 0-indexed four atoms (i, j, k, l) defining the scanned dihedral.
+        step_deg (float): The dihedral increment in degrees.
+        nsteps (int): The number of increments (the walk visits ``nsteps`` + 1 points).
+        top (list): The 0-indexed rotating group.
+        fmax (float): The force convergence criterion in eV/Angstrom.
+        steps (int): The maximum optimizer steps per point.
+        direction (int): +1 for a 0->360 walk, -1 for a 360->0 walk.
+        optimizer: The ASE optimizer class to relax each point.
+
+    Returns:
+        tuple: (energies in eV, residual max-forces in eV/Angstrom), each of length ``nsteps`` + 1.
+    """
+    i, j, k, l = torsion
+    work = atoms.copy()
+    work.calc = atoms.calc
+    energies, residual_forces = list(), list()
+    for n in range(nsteps + 1):
+        if n:
+            work.rotate_dihedral(i, j, k, l, angle=direction * step_deg, indices=top)
+        target = work.get_dihedral(i, j, k, l)
+        work.set_constraint(FixInternals(dihedrals_deg=[[target, [i, j, k, l]]]))
+        opt = optimizer(work, logfile=None)
+        opt.run(fmax=fmax, steps=steps)
+        # Residual force WITH the dihedral constraint still applied is the convergence criterion:
+        # reading opt.converged() after clearing the constraint re-evaluates the free torsional
+        # force, which is nonzero everywhere except the stationary points.
+        residual = float(np.sqrt((work.get_forces() ** 2).sum(axis=1)).max())
+        work.set_constraint()
+        energies.append(float(work.get_potential_energy()))
+        residual_forces.append(residual)
+    return energies, residual_forces
+
+
+def relaxed_torsion_scan(atoms: Atoms, torsion: list, step_deg: float, nsteps: int,
+                         top: list = None, fmax: float = 0.005, steps: int = 500,
+                         optimizer=LBFGS) -> dict:
+    """
+    Perform a full 1D relaxed torsional scan in a single process.
+
+    The torsion is swept 0->360 and 360->0 from the same starting geometry, and the lower energy
+    of the two walks is kept at each grid point. A single directional walk is path-dependent: if a
+    coupled coordinate flips partway round, that walk finishes in a different conformer and its
+    curve is not a torsional potential. Walking both ways and taking the pointwise minimum recovers
+    the lowest torsional path, which is the one the downstream statistical mechanics wants.
+
+    Points that do not fully converge are kept (never dropped), so the periodic grid the downstream
+    Fourier fit reads is always complete; ``fmax_worst`` reports the largest residual force.
+
+    Args:
+        atoms (Atoms): The molecule with a calculator attached.
+        torsion (list): The 0-indexed four atoms (i, j, k, l) defining the scanned dihedral.
+        step_deg (float): The dihedral increment in degrees.
+        nsteps (int): The number of increments; the returned grid has ``nsteps`` + 1 points.
+        top (list, optional): The 0-indexed rotating group; determined from the graph if not given.
+        fmax (float): The force convergence criterion in eV/Angstrom.
+        steps (int): The maximum optimizer steps per point.
+        optimizer: The ASE optimizer class to relax each point.
+
+    Raises:
+        ValueError: If ``nsteps`` is less than 1 or ``step_deg`` is not positive.
+
+    Returns:
+        dict: ``energies`` (absolute, in eV, ``nsteps`` + 1 points with the endpoint duplicating the
+        start), ``angles`` (degrees, 0..360), ``top``, and convergence diagnostics.
+    """
+    if nsteps < 1:
+        raise ValueError(f'A relaxed torsion scan needs at least one increment, but got nsteps={nsteps}.')
+    if step_deg <= 0:
+        raise ValueError(f'The dihedral increment must be positive, but got step_deg={step_deg}.')
+    i, j, k, l = torsion
+    if top is None:
+        top = rotor_top(atoms, j, k)
+
+    e_f, r_f = _scan_walk(atoms, torsion, step_deg, nsteps, top, fmax, steps, +1, optimizer)
+    e_b, r_b = _scan_walk(atoms, torsion, step_deg, nsteps, top, fmax, steps, -1, optimizer)
+
+    npts = nsteps  # unique grid points; the walk's index nsteps maps back onto index 0
+    grid_f = np.full(npts, np.inf)
+    grid_b = np.full(npts, np.inf)
+    for n in range(nsteps + 1):
+        p = n % npts  # forward:  phi = +n*step
+        grid_f[p] = min(grid_f[p], e_f[n])
+        q = (-n) % npts  # backward: phi = -n*step
+        grid_b[q] = min(grid_b[q], e_b[n])
+    merged = np.minimum(grid_f, grid_b)
+    energies = merged.tolist()
+    energies.append(energies[0])  # duplicate endpoint: 46-point protocol
+    angles = [n * step_deg for n in range(nsteps + 1)]
+    return {
+        'energies': energies,
+        'angles': angles,
+        'top': top,
+        'branch_gap_max': float(np.abs(grid_f - grid_b).max()),
+        'fmax_worst': float(max(r_f + r_b)),
+        'converged': bool(max(r_f + r_b) <= fmax),
+    }
+
+
+def run_torsion_scan(atoms: Atoms, input_dict: dict, settings: dict) -> dict:
+    """
+    Run a 1D relaxed torsional scan for an ARC ``scan`` job and shape it for ARC's YAML parser.
+
+    Args:
+        atoms (Atoms): The molecule with a calculator attached.
+        input_dict (dict): The job input; ``torsions`` (a list holding one 0-indexed torsion) and
+                           ``scan_res`` (the dihedral increment in degrees) are read here.
+        settings (dict): ASE run settings; optional ``fmax``, ``steps``, ``optimizer`` override the
+                         relaxed-scan defaults (LBFGS, fmax 0.005 eV/Angstrom, 500 steps per point).
+
+    Raises:
+        ValueError: If no torsion is supplied or more than one is (a 1D scan sweeps a single
+                    torsion), or if ``scan_res`` is not positive.
+
+    Returns:
+        dict: ``energies`` (Hartree) and ``angles`` (degrees) for ARC's YAML scan parser, plus the
+        rotating ``top`` and convergence diagnostics.
+    """
+    torsions = input_dict.get('torsions')
+    if not torsions:
+        raise ValueError("A 'scan' job requires a torsion, but none was supplied.")
+    if len(torsions) > 1:
+        raise ValueError(f"A 1D 'scan' job sweeps a single torsion, but got {len(torsions)}: {torsions}.")
+    torsion = list(torsions[0])
+    scan_res = float(input_dict.get('scan_res', 8.0))
+    if scan_res <= 0:
+        raise ValueError(f"The scan resolution must be positive, but got scan_res={scan_res}.")
+    nsteps = int(round(360.0 / scan_res))
+    fmax = float(settings.get('fmax', 0.005))
+    steps = int(settings.get('steps', 500))
+    engine_dict = {'bfgs': BFGS, 'lbfgs': LBFGS, 'gpmin': GPMin,
+                   'scipyfminbfgs': SciPyFminBFGS, 'scipyfmincg': SciPyFminCG}
+    optimizer = engine_dict.get(str(settings.get('optimizer', 'LBFGS')).lower(), LBFGS)
+
+    result = relaxed_torsion_scan(atoms, torsion, scan_res, nsteps, top=None,
+                                  fmax=fmax, steps=steps, optimizer=optimizer)
+    # ARC's YAML scan parser reads absolute energies and subtracts the minimum before converting
+    # Hartree->kJ/mol, so the energies must be in Hartree.
+    result['energies'] = [energy * e / E_h for energy in result['energies']]
+    return result
+
 
 def is_linear(atoms: Atoms) -> bool:
     """
@@ -344,6 +544,13 @@ def main():
 
     if job_type == 'sp':
         output['sp'] = to_kJmol(atoms.get_potential_energy())
+
+    if job_type == 'scan':
+        try:
+            output.update(run_torsion_scan(atoms, input_dict, settings))
+        except Exception as exc:
+            output['success'] = False
+            output['error'] = f"Torsion scan failed: {exc}"
 
     if job_type in ['opt', 'conf_opt', 'optfreq', 'directed_scan']:
         fmax = float(settings.get('fmax', 0.001))
